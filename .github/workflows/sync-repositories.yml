@@ -1,0 +1,96 @@
+name: Sync GitHub Repositories
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    paths:
+      - ".github/workflows/sync-repositories.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repository-registry-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout registry
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_REPO_SYNC_TOKEN || github.token }}
+          ref: main
+
+      - name: Verify sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.GH_REPO_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Tambahkan secret GH_REPO_SYNC_TOKEN terlebih dahulu. Token harus dapat membaca repository akun dan menulis ke github-repo."
+            exit 1
+          fi
+
+      - name: Collect repositories
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_REPO_SYNC_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const owner = 'kuro-myths';
+            const repos = await github.paginate(github.rest.repos.listForAuthenticatedUser, {
+              affiliation: 'owner,collaborator,organization_member',
+              visibility: 'all',
+              per_page: 100,
+              sort: 'full_name',
+              direction: 'asc'
+            });
+
+            const owned = repos
+              .filter(repo => repo.owner?.login?.toLowerCase() === owner)
+              .map(repo => ({
+                id: repo.id,
+                name: repo.name,
+                full_name: repo.full_name,
+                description: repo.description || '',
+                url: repo.html_url,
+                clone_url: repo.clone_url,
+                default_branch: repo.default_branch,
+                visibility: repo.visibility,
+                private: repo.private,
+                archived: repo.archived,
+                fork: repo.fork,
+                language: repo.language,
+                created_at: repo.created_at,
+                updated_at: repo.updated_at,
+                pushed_at: repo.pushed_at
+              }))
+              .sort((a, b) => a.name.localeCompare(b.name));
+
+            const output = {
+              schema_version: 1,
+              owner,
+              generated_at: new Date().toISOString(),
+              total: owned.length,
+              repositories: owned
+            };
+
+            fs.mkdirSync('data', { recursive: true });
+            fs.writeFileSync('data/repositories.json', JSON.stringify(output, null, 2) + '\n');
+            core.info(`Berhasil mengumpulkan ${owned.length} repository milik ${owner}.`);
+            core.setOutput('count', String(owned.length));
+
+      - name: Commit registry
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/repositories.json
+          if git diff --cached --quiet; then
+            echo "Registry sudah terbaru; tidak ada perubahan."
+          else
+            git commit -m "chore: sync GitHub repository registry"
+            git push origin HEAD:main
+          fi
